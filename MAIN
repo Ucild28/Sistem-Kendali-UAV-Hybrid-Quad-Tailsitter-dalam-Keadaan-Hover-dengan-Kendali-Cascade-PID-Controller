@@ -1,0 +1,193 @@
+//=============== HEADER LIBRARY =================
+// #include <HardwareSerial.h>
+#include "HardwareSerial.h"
+#include "CRSFforArduino.hpp"
+#include "Kalman.h"
+#include <Wire.h>
+#include <HMC5883L.h>
+#include "Servo.h"
+
+//================ MPU6050 AND KALMAN FILTER ================
+#define RESTRICT_PITCH
+Kalman kalmanX;
+Kalman kalmanY;
+Kalman kalmanZ;
+
+const uint8_t MPU6050 = 0x68;
+double accX, accY, accZ;
+double gyroX, gyroY, gyroZ;
+double gyro_roll, gyro_pitch, gyro_yaw;
+double gyro_roll_cal, gyro_pitch_cal, gyro_yaw_cal;
+int16_t tempRaw;
+double gyroXangle, gyroYangle, gyroZangle; // Angle calculate using the gyro only
+double compAngleX, compAngleY, compAngleZ; // Calculated angle using a complementary filter
+double kalAngleX, kalAngleY, kalAngleZ; // Calculated angle using a Kalman filter
+double gyro_roll_input, gyro_pitch_input, gyro_yaw_input;
+
+uint32_t timer, looptimer;
+uint8_t i2cData[14]; // Buffer for I2C data
+int cal_int;
+
+double roll;
+double pitch;
+double yaw;
+double gyroXrate;
+double gyroYrate;
+double gyroZrate;
+
+#define ROLL_SIGN_CORRECTION (-1)  // ubah ke 1 jika roll kanan sudah positif
+#define PITCH_SIGN_CORRECTION (1)
+
+//================ COMPASS ================
+HMC5883L compass;
+// float headingDegrees;
+// float setHeading;
+// float heading_reference;
+
+float headingDegrees, headingDegreesPrev;
+float fixedHeadingDegrees;
+float heading, setHeading;
+float heading_reference;
+float heading_control;
+float acc_x, acc_y;
+float compensateRoll, compensatePitch;
+float cosComRoll, sinComRoll, cosComPitch, sinComPitch;
+float Yh, Xh, Ymag_correct, Xmag_correct;
+float declinationAngle;
+int head = 0;
+
+int16_t ax, ay, az;
+
+//================ REMOTE ================
+volatile int roll_channel     = 0;
+volatile int pitch_channel    = 0;
+volatile int throttle_channel = 0;
+volatile int yaw_channel      = 0;
+volatile int ch5_channel      = 0;
+volatile int ch6_channel      = 0;
+volatile int ch7_channel      = 0;
+volatile int ch8_channel      = 0;
+
+int roll_mapping;
+int pitch_mapping;
+int yaw_mapping;
+
+int armStatus   = 0;
+int ch5, ch6, ch7, ch8;
+int channel5    = 0;
+int throttle;
+int throttleMotor;
+int posHold_mode, altHold_mode, head_mode, head_mode1;
+int statusmode;
+int pulse_esc1  = 0;
+int pulse_esc2  = 0; 
+int pulse_esc3  = 0; 
+int pulse_esc4  = 0;
+
+int roll_input, pitch_input, yaw_input;
+float pitch_ch_previous, roll_ch_previous, yaw_ch_previous, throt_ch_previous;
+char inChar;
+bool mati = 0;
+
+//================ ELRS ================
+CRSFforArduino *crsf = nullptr;
+HardwareSerial Serial6(PC7,PC6); // define serial port GPS2 FC ARROW V2.1
+int rcChannelCount = crsfProtocol::RC_CHANNEL_COUNT;
+void onReceiveRcChannels(serialReceiverLayer::rcChannels_t *rcChannels); // is it important?
+
+//================ MOTOR ================
+#define MIN_PULSE_LENGTH 1000 // Minimum pulse length in µs
+#define MAX_PULSE_LENGTH 2000 // Maximum pulse length in µs
+Servo M1, M2, M3, M4;
+unsigned long pulse_length_esc1 = 1000,
+              pulse_length_esc2 = 1000,
+              pulse_length_esc3 = 1000,
+              pulse_length_esc4 = 1000;
+
+//================ CONTROL ================
+float rollAngleSetpoint;
+float rollAngleError;
+float rollRateSetpoint;
+float pitchAngleSetpoint;
+float pitchAngleError;
+float pitchRateSetpoint;
+float gyroRoll, gyroPitch, gyroYaw;
+float rollSetpoint, pitchSetpoint, yawSetpoint;
+float rollLevel, pitchLevel, yawLevel;
+float errorRoll, errorPitch, errorYaw;
+float ControllerIRoll, ControllerDRoll, ControllerDRollLast;
+float ControllerIPitch, ControllerDPitch, ControllerDPitchLast;
+float ControllerIYaw, ControllerDYaw, ControllerDYawLast;
+float ControlRoll, ControlPitch, ControlYaw;
+int start;
+
+//================ TUNING ================
+float Gain_P_angle_roll   = 0;
+float Gain_P_angle_pitch  = 0.5;
+float Gain_P_angle_yaw    = 0;
+float Gain_I_angle_roll   = 0;
+float Gain_I_angle_pitch  = 0;
+float Gain_I_angle_yaw    = 0;
+
+float Gain_P_roll   = 1.17; 
+float Gain_I_roll   = 0;    
+float Gain_D_roll   = 0.01; 
+float Gain_P_pitch  = 0.7;
+float Gain_I_pitch  = 0;
+float Gain_D_pitch  = 0.001;
+float Gain_P_yaw    = 0.8;
+float Gain_I_yaw    = 0;
+float Gain_D_yaw    = 0;
+int maxController   = 100;
+
+//================ TIMER ================
+uint32_t timeProgram, previousTimeProgram;
+unsigned long timerPrintOut;
+unsigned long print_time;
+
+int danger = 0;
+
+String status;
+
+float vin, vout, adc; //Battery Status
+
+// HardwareSerial Serial2(PA10,PA9); //GPS Connection
+//==================================================================================================================================================
+
+void setup()
+{
+  Wire.begin();
+  Serial.begin(57600); //define serial 1, port Telem 2 FC ARROW V2.1
+  while (i2cWrite(MPU6050, 0x6B, 0x01, true)); 
+  init_imu();
+  elrs_init();
+  motor_setup();
+  compass_init();
+}
+
+void loop()
+{
+  gyroaccell_signal();
+
+  gyro_roll  -= gyro_roll_cal;
+	gyro_pitch -= gyro_pitch_cal;
+	gyro_yaw   -= gyro_yaw_cal;
+
+	gyro_roll_input  = (gyro_roll_input  * 0.8) + ((gyro_roll  / 57.14286) * 0.2);				//Gyro pid input is deg/sec.
+	gyro_pitch_input = (gyro_pitch_input * 0.8) + ((gyro_pitch / 57.14286) * 0.2);				//Gyro pid input is deg/sec.
+	gyro_yaw_input   = (gyro_yaw_input   * 0.8) + ((gyro_yaw   / 57.14286) * 0.2);				//Gyro pid input is deg/sec.
+  // float rollRate   = (gyro_roll_input * 0.8) + ((gyro_roll / 57.14286) * 0.2);       // smoothing gyro
+
+  mapremote();
+  serialEvent();
+  update_motor();
+  compass_update();
+  // batterypercent();
+
+  timeProgram = micros();
+  if (timeProgram - previousTimeProgram >= 100000)
+  {
+    print_out();
+    previousTimeProgram = micros();
+  }
+}
